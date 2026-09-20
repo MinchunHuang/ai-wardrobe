@@ -1,30 +1,14 @@
-# AI Wardrobe V2 — Vercel Static Deploy
+# AI Wardrobe V3
 
-這是零建置（zero-build）的靜態 PWA 原型，可直接部署到 Vercel。
+V3 focuses on a real-photo wardrobe flow:
+- Multi-photo upload
+- Photo-driven detected item cards
+- Suspected same-item / multi-angle merge confirmation
+- Rich item detail sheet with main photo, angle photos, and metadata
+- Today uses newly-added real-photo wardrobe items when available
+- Desktop keeps left navigation only; mobile uses bottom navigation
 
-## 本版變更
-- AI Import 支援一次選擇多張圖片（`multiple`）。
-- 可同時預覽多張照片，超過 5 張以 +N 顯示。
-- 桌機版只保留左側主選單；右側內容底部不再顯示重複橫向主選單。
-- 手機版因沒有左側選單，仍保留底部主選單。
-- 補齊 `manifest.webmanifest`、`sw.js`、`vercel.json`，可直接部署。
+AI segmentation and similarity are still interactive prototype logic in V3. The UI/data flow is ready for a real vision model and Supabase in the next stage.
 
-## Vercel Dashboard 部署
-1. 解壓縮 ZIP。
-2. 將資料夾放到 GitHub repository（推薦）。
-3. Vercel Dashboard → Add New → Project。
-4. Import 該 GitHub repository。
-5. Framework Preset 選 Other。
-6. Build Command 留空；Output Directory 留空；Install Command 留空。
-7. Deploy。
-
-## Vercel CLI（最快）
-```bash
-npm i -g vercel
-cd wardrobe-ai-vercel-v2
-vercel
-```
-第一次依提示建立新 Project；確認預覽正常後：
-```bash
-vercel --prod
-```
+## Vercel
+Static site. Deploy the folder as-is with Framework Preset = Other. No build command required.
