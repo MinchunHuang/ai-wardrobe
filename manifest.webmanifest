@@ -1,0 +1,9 @@
+{
+  "name": "私人造型師 AI Wardrobe",
+  "short_name": "AI Wardrobe",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f0e9",
+  "theme_color": "#f4efe7",
+  "lang": "zh-Hant"
+}
