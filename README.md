@@ -1,17 +1,14 @@
-# AI Wardrobe V4
+# AI Wardrobe V4.1
 
-V4 upgrades the import flow from prototype crops to real in-browser clothing semantic segmentation.
+V4.1 keeps the real browser-side clothing segmentation from V4 and adds a cleanup + human-review layer based on the first real user tests.
 
-## Real AI segmentation
-- Browser-side Transformers.js
-- Model: Xenova/segformer_b2_clothes (q8 ONNX)
-- Detects / segments upper-clothes, pants, skirt, dress, shoes, bag, hat, sunglasses, belt and scarf
-- Produces transparent PNG cutouts from actual model masks
-- Left/right shoes are merged into a single shoe item
-- Multi-photo same-item suggestions use category + color + silhouette heuristics (not yet deep garment embeddings)
+## V4.1 changes
+- Connected-component cleanup removes detached segmentation speckles.
+- Class-specific minimum/maximum area gates reject obvious tiny false positives.
+- Pants/Skirt conflicts are post-processed per source image.
+- Ambiguous lower-body results are marked for user confirmation instead of being presented as certain.
+- Upper-clothes results warn that layered outerwear + innerwear can still be merged by this human-parsing model.
+- Service-worker cache bumped to V4.1 and includes `ai-segmentation.js`.
 
-## Privacy
-The V4 frontend performs segmentation locally in the browser. Model files are downloaded from Hugging Face; selected photos are not sent to an AI Wardrobe backend by this version.
-
-## Notes
-The clothing parser is strongest on people wearing clothes. Flat-lay images, wardrobes with many overlapping garments, and non-human product photos can be weaker. That is a known V4 limitation.
+## Still a known model limitation
+The SegFormer human-parsing model is semantic, not garment-instance segmentation. It can merge a jacket and inner top into one Upper-clothes region, and cropped wide pants can be confused with skirts. Solving that requires V4.2 dual-model/instance segmentation rather than more UI heuristics.
