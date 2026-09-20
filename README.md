@@ -1,14 +1,17 @@
-# AI Wardrobe V4.1
+# AI Wardrobe V4.3 — Server AI Alpha
 
-V4.1 keeps the real browser-side clothing segmentation from V4 and adds a cleanup + human-review layer based on the first real user tests.
+## 架構改動
+- 主辨識不再在 iPhone Safari 裡跑 ONNX。
+- 手機只建立 <=235KB 的推論副本，逐張 POST 到 `/api/analyze`。
+- Vercel Serverless Function 以 `REPLICATE_API_TOKEN` 呼叫 Replicate 上的 SAM 3。
+- SAM 3 以文字概念做 open-vocabulary instance segmentation；人物穿搭與單件平拍共用主模型。
+- 細小配件不強迫從全身照辨識，改用「配件近拍」模式。
 
-## V4.1 changes
-- Connected-component cleanup removes detached segmentation speckles.
-- Class-specific minimum/maximum area gates reject obvious tiny false positives.
-- Pants/Skirt conflicts are post-processed per source image.
-- Ambiguous lower-body results are marked for user confirmation instead of being presented as certain.
-- Upper-clothes results warn that layered outerwear + innerwear can still be merged by this human-parsing model.
-- Service-worker cache bumped to V4.1 and includes `ai-segmentation.js`.
+## 必要環境變數
+在 Vercel Project -> Settings -> Environment Variables 新增：
+`REPLICATE_API_TOKEN`
 
-## Still a known model limitation
-The SegFormer human-parsing model is semantic, not garment-instance segmentation. It can merge a jacket and inner top into one Upper-clothes region, and cropped wide pants can be confused with skirts. Solving that requires V4.2 dual-model/instance segmentation rather than more UI heuristics.
+取得方式：Replicate 帳號的 API tokens 頁面。
+
+## 目前 Alpha 注意
+Replicate SAM3 wrapper 回傳 JSON 的 mask 格式可能隨模型版本變動。`api/analyze.js` 已對 boxes/scores/predictions/mask URL 做容錯解析；如果某次輸出沒有直接可用的 cutout URL，前端會暫時以模型 bbox 從原始照片裁切顯示，並保留 debug shape，方便下一版補齊 mask parser。
