@@ -1,7 +1,7 @@
 import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
 
 const ORT_VERSION = '1.30.0';
-const CACHE_NAME = 'ai-wardrobe-models-v5-1';
+const CACHE_NAME = 'ai-wardrobe-models-v5-2';
 
 // V5.1: route by scene. Outfit uses human-clothes parsing; single/flat uses fashion detection + foreground matting.
 const OUTFIT_MODEL = 'Xenova/segformer_b2_clothes';
@@ -41,7 +41,7 @@ let outfitPipelinePromise = null;
 let detectorSessionPromise = null;
 let cutoutSessionPromise = null;
 let runtimeInfo = {
-  version:'5.1-local-router',
+  version:'5.2-local-router',
   outfitModel:OUTFIT_MODEL,
   singleDetector:DETECTOR_ID,
   singleCutout:CUTOUT_ID,
@@ -102,11 +102,29 @@ async function bitmapToBlobURL(bm,maxSide=1600){const scale=Math.min(1,maxSide/M
 async function canvasBlobURL(c,type='image/webp',quality=.92){const b=await new Promise((res,rej)=>c.toBlob(x=>x?res(x):rej(new Error('影像輸出失敗')),type,quality));return URL.createObjectURL(b);}
 
 // ---------- Outfit / human-worn clothes ----------
+function maskPixelValue(mask,p){
+  const data=mask?.data;if(!data)return 0;const ch=Math.max(1,mask.channels||Math.round(data.length/Math.max(1,(mask.width||1)*(mask.height||1)))||1),base=p*ch;
+  let v=0;
+  if(ch===1)v=Number(data[base]||0);
+  else {const lim=Math.min(3,ch);for(let c=0;c<lim;c++)v=Math.max(v,Number(data[base+c]||0));}
+  if(v<=1.5)v*=255;
+  return clamp(v,0,255);
+}
 async function segmentationResultToMaskCanvas(seg){
   const mask=seg.mask;
-  if(mask?.toCanvas)return mask.toCanvas();
+  // Transformers.js RawImage masks may render through toCanvas() with an opaque alpha channel.
+  // Build alpha from the mask pixel values first; otherwise the whole photo becomes foreground.
+  if(mask?.data&&mask.width&&mask.height){
+    const c=document.createElement('canvas');c.width=mask.width;c.height=mask.height;const ctx=c.getContext('2d'),img=ctx.createImageData(mask.width,mask.height),pixels=mask.width*mask.height;
+    for(let p=0;p<pixels;p++){const a=maskPixelValue(mask,p)>8?255:0,j=p*4;img.data[j]=img.data[j+1]=img.data[j+2]=255;img.data[j+3]=a;}
+    ctx.putImageData(img,0,0);return c;
+  }
   if(mask instanceof HTMLCanvasElement)return mask;
-  if(mask?.data&&mask.width&&mask.height){const c=document.createElement('canvas');c.width=mask.width;c.height=mask.height;const ctx=c.getContext('2d'),img=ctx.createImageData(mask.width,mask.height);for(let i=0;i<mask.data.length;i++){const a=mask.data[i]>0?255:0,j=i*4;img.data[j]=img.data[j+1]=img.data[j+2]=255;img.data[j+3]=a;}ctx.putImageData(img,0,0);return c;}
+  if(mask?.toCanvas){
+    const raw=await mask.toCanvas(),ctx=raw.getContext('2d',{willReadFrequently:true}),im=ctx.getImageData(0,0,raw.width,raw.height),d=im.data;
+    // Ignore source alpha; use luminance as the semantic foreground mask.
+    for(let i=0;i<d.length;i+=4){const v=Math.max(d[i],d[i+1],d[i+2]);d[i]=d[i+1]=d[i+2]=255;d[i+3]=v>8?255:0;}ctx.putImageData(im,0,0);return raw;
+  }
   throw new Error('Outfit parser mask 格式不支援');
 }
 async function makeSemanticCutout(bm,segments,labels){
@@ -124,7 +142,9 @@ async function makeSemanticCutout(bm,segments,labels){
   const pix=ctx.getImageData(0,0,ow,oh).data;let r=0,g=0,b=0,n=0;for(let i=0;i<pix.length;i+=16)if(pix[i+3]>50){r+=pix[i];g+=pix[i+1];b+=pix[i+2];n++;}
   const url=await canvasBlobURL(out);alpha.width=alpha.height=out.width=out.height=1;return {url,box:[x0,y0,cw,ch],avgColor:n?[Math.round(r/n),Math.round(g/n),Math.round(b/n)]:[128,128,128]};
 }
-function maskAreaRatio(seg){const m=seg.mask;if(m?.data){const ch=m.channels||1;let n=0,pixels=Math.floor(m.data.length/ch);for(let p=0;p<pixels;p++){let active=false;for(let c=0;c<ch;c++)if(m.data[p*ch+c]>0){active=true;break;}if(active)n++;}return n/Math.max(1,pixels);}return 0;}
+function maskAreaRatio(seg){
+  const m=seg.mask;if(!m?.data||!m.width||!m.height)return 0;const pixels=m.width*m.height;let n=0;for(let p=0;p<pixels;p++)if(maskPixelValue(m,p)>8)n++;return n/Math.max(1,pixels);
+}
 async function analyzeOutfit(file,sourceIndex,onProgress,preSegments=null){
   const bm=await loadBitmap(file),url=await bitmapToBlobURL(bm,1600),pipe=await getOutfitPipeline(onProgress),segments=preSegments||await pipe(url),items=[];URL.revokeObjectURL(url);
   const byLabel=new Map();for(const s of segments){if(!byLabel.has(s.label))byLabel.set(s.label,[]);byLabel.get(s.label).push(s);}
@@ -148,15 +168,41 @@ function decodeYoloDetection(tensor,conf=.18){
   else if(d[2]===4+nc){count=d[1];channels=d[2];at=(n,c)=>tensor.data[n*channels+c];}
   else if(d[2]===6){return Array.from({length:d[1]},(_,n)=>({box:[tensor.data[n*6],tensor.data[n*6+1],tensor.data[n*6+2],tensor.data[n*6+3]],score:tensor.data[n*6+4],classId:Math.round(tensor.data[n*6+5])})).filter(x=>x.score>=conf);}
   else throw new Error(`Fashion detector channels 不符：${d.join('×')}`);
-  const out=[];for(let n=0;n<count;n++){const cx=at(n,0),cy=at(n,1),w=at(n,2),h=at(n,3);let score=-Infinity,classId=-1;for(let c=0;c<nc;c++){const s=at(n,4+c);if(s>score){score=s;classId=c;}}if(score<conf)continue;out.push({box:[cx-w/2,cy-h/2,cx+w/2,cy+h/2],score,classId});}return out;
+  const out=[];for(let n=0;n<count;n++){const cx=at(n,0),cy=at(n,1),w=at(n,2),h=at(n,3),scores=[];for(let c=0;c<nc;c++)scores.push({classId:c,score:Number(at(n,4+c))});scores.sort((a,b)=>b.score-a.score);const top=scores[0];if(!top||top.score<conf)continue;out.push({box:[cx-w/2,cy-h/2,cx+w/2,cy+h/2],score:top.score,classId:top.classId,classCandidates:scores.slice(0,3)});}return out;
 }
 function inverseDetBox(box,prep){const [x1,y1,x2,y2]=box;const sx1=clamp((x1-prep.padX)/prep.scale,0,prep.sourceWidth),sy1=clamp((y1-prep.padY)/prep.scale,0,prep.sourceHeight),sx2=clamp((x2-prep.padX)/prep.scale,0,prep.sourceWidth),sy2=clamp((y2-prep.padY)/prep.scale,0,prep.sourceHeight);return [sx1,sy1,Math.max(1,sx2-sx1),Math.max(1,sy2-sy1)];}
 async function detectFashion(bm,onProgress,allowedSet){const ort=getOrt(),s=await getDetector(onProgress),name=s.inputNames?.[0]||'images',meta=s.inputMetadata?.[0]||{},dims=meta.shape||meta.dimensions||[],h=Number(dims[dims.length-2]),size=Number.isFinite(h)&&h>0?h:640,prep=prepareYoloInput(bm,size,ort),start=performance.now(),out=await s.run({[name]:prep.tensor}),pred=Object.values(out).find(t=>t?.dims?.length===3);if(!pred)throw new Error('Fashion detector 沒有 detection tensor');let dets=decodeYoloDetection(pred,.15).filter(x=>allowedSet.has(x.classId));for(const d of dets){if(Math.max(...d.box.map(Math.abs))<=2.2)d.box=d.box.map(v=>v*size);}dets=nms(dets,.45,8);for(const d of dets)d.sourceBox=inverseDetBox(d.box,prep);return {dets,ms:Math.round(performance.now()-start),size};}
 function choosePrimary(dets,bm){if(!dets.length)return null;return [...dets].sort((a,b)=>{const aa=(a.sourceBox[2]*a.sourceBox[3])/(bm.width*bm.height),bb=(b.sourceBox[2]*b.sourceBox[3])/(bm.width*bm.height);return (b.score*Math.pow(bb,.28))-(a.score*Math.pow(aa,.28));})[0];}
 function cropCanvas(bm,box,pad=.06,maxSide=1400){const [x,y,w,h]=box,px=w*pad,py=h*pad,x0=clamp(x-px,0,bm.width),y0=clamp(y-py,0,bm.height),x1=clamp(x+w+px,0,bm.width),y1=clamp(y+h+py,0,bm.height),cw=x1-x0,ch=y1-y0,sc=Math.min(1,maxSide/Math.max(cw,ch)),ow=Math.max(1,Math.round(cw*sc)),oh=Math.max(1,Math.round(ch*sc)),c=document.createElement('canvas');c.width=ow;c.height=oh;c.getContext('2d').drawImage(bm,x0,y0,cw,ch,0,0,ow,oh);return {canvas:c,sourceBox:[x0,y0,cw,ch]};}
 function u2TensorFromCanvas(c,ort){const t=document.createElement('canvas');t.width=t.height=320;const ctx=t.getContext('2d',{willReadFrequently:true});ctx.drawImage(c,0,0,320,320);const rgba=ctx.getImageData(0,0,320,320).data,plane=320*320,data=new Float32Array(plane*3),mean=[.485,.456,.406],std=[.229,.224,.225];let max=1;for(let i=0;i<rgba.length;i+=4)max=Math.max(max,rgba[i],rgba[i+1],rgba[i+2]);for(let i=0,p=0;i<rgba.length;i+=4,p++){data[p]=(rgba[i]/max-mean[0])/std[0];data[plane+p]=(rgba[i+1]/max-mean[1])/std[1];data[plane*2+p]=(rgba[i+2]/max-mean[2])/std[2];}t.width=t.height=1;return new ort.Tensor('float32',data,[1,3,320,320]);}
-async function applyU2Net(c,onProgress){const ort=getOrt(),s=await getCutout(onProgress),input=s.inputNames?.[0]||'input.1',tensor=u2TensorFromCanvas(c,ort),out=await s.run({[input]:tensor}),sal=Object.values(out)[0],arr=sal.data;let lo=Infinity,hi=-Infinity;for(let i=0;i<arr.length;i++){lo=Math.min(lo,arr[i]);hi=Math.max(hi,arr[i]);}const md=document.createElement('canvas');md.width=md.height=320;const ctx=md.getContext('2d'),im=ctx.createImageData(320,320),den=Math.max(1e-6,hi-lo);for(let i=0;i<arr.length;i++){const v=clamp((arr[i]-lo)/den,0,1),a=Math.round(clamp((v-.18)/.62,0,1)*255),j=i*4;im.data[j]=im.data[j+1]=im.data[j+2]=255;im.data[j+3]=a;}ctx.putImageData(im,0,0);const mask=document.createElement('canvas');mask.width=c.width;mask.height=c.height;const mctx=mask.getContext('2d');mctx.imageSmoothingEnabled=true;mctx.drawImage(md,0,0,c.width,c.height);const outc=document.createElement('canvas');outc.width=c.width;outc.height=c.height;const o=outc.getContext('2d');o.drawImage(c,0,0);o.globalCompositeOperation='destination-in';o.drawImage(mask,0,0);o.globalCompositeOperation='source-over';const pix=o.getImageData(0,0,outc.width,outc.height).data;let r=0,g=0,b=0,n=0;for(let i=0;i<pix.length;i+=16)if(pix[i+3]>55){r+=pix[i];g+=pix[i+1];b+=pix[i+2];n++;}const url=await canvasBlobURL(outc);md.width=md.height=mask.width=mask.height=outc.width=outc.height=1;return {url,avgColor:n?[Math.round(r/n),Math.round(g/n),Math.round(b/n)]:[128,128,128]};}
-async function analyzeSingle(file,sourceIndex,onProgress,accessory=false){const bm=await loadBitmap(file),allowed=accessory?ACCESSORY_CLASSES:MAIN_SINGLE_CLASSES,{dets,ms,size}=await detectFashion(bm,onProgress,allowed),best=choosePrimary(dets,bm);let box=best?.sourceBox||[0,0,bm.width,bm.height],meta=best?FP_META[best.classId]:['單品（請確認）',accessory?'配件':'上衣'],label=best?FP_CLASSES[best.classId]:'unknown',conf=best?Math.round(best.score*100):0;const crop=cropCanvas(bm,box,best?.score>.22?.08:.02),cut=await applyU2Net(crop.canvas,onProgress),bbox=normalizedBox(crop.sourceBox,bm.width,bm.height),item={id:`${sourceIndex}-single-${Math.random().toString(36).slice(2)}`,name:meta[0],cat:meta[1],label,sourceIndex,sourceName:file.name,sourceWidth:bm.width,sourceHeight:bm.height,requestedMode:accessory?'accessory':'single',routeMode:accessory?'accessory':'single',classificationConfidence:conf,needsGenericCategoryReview:conf<35,reviewReason:conf<35?'服飾分類器信心偏低；去背仍保留，請確認類別。':'',layerWarning:'',photo:cut.url,photoType:'detector+foreground-mask',bbox,areaRatio:bbox[2]*bbox[3],aspect:bbox[2]/Math.max(.001,bbox[3]),avgColor:cut.avgColor,localDebug:{engine:'FashionPedia detector + U2Netp',detectorMs:ms,inputSize:size,detections:dets.length}};crop.canvas.width=crop.canvas.height=1;bm.close?.();onProgress?.({type:'inference',sourceIndex,stage:'done',count:1,mode:item.routeMode,ms,backend:runtimeInfo.backend});return [item];}
+async function applyU2Net(c,onProgress){
+  const ort=getOrt(),s=await getCutout(onProgress),input=s.inputNames?.[0]||'input.1',tensor=u2TensorFromCanvas(c,ort),out=await s.run({[input]:tensor}),sal=Object.values(out)[0],arr=sal.data;
+  let lo=Infinity,hi=-Infinity;for(let i=0;i<arr.length;i++){lo=Math.min(lo,arr[i]);hi=Math.max(hi,arr[i]);}
+  const md=document.createElement('canvas');md.width=md.height=320;const ctx=md.getContext('2d'),im=ctx.createImageData(320,320),den=Math.max(1e-6,hi-lo);let strong=0;
+  // U2Net's documented postprocess is min-max -> 0..255 alpha. Do not hard-threshold dark garments.
+  for(let i=0;i<arr.length;i++){const v=clamp((arr[i]-lo)/den,0,1),a=Math.round(v*255),j=i*4;im.data[j]=im.data[j+1]=im.data[j+2]=255;im.data[j+3]=a;if(a>64)strong++;}
+  ctx.putImageData(im,0,0);const coverage=strong/(320*320);
+  const mask=document.createElement('canvas');mask.width=c.width;mask.height=c.height;const mctx=mask.getContext('2d');mctx.imageSmoothingEnabled=true;mctx.drawImage(md,0,0,c.width,c.height);
+  const outc=document.createElement('canvas');outc.width=c.width;outc.height=c.height;const o=outc.getContext('2d');o.drawImage(c,0,0);o.globalCompositeOperation='destination-in';o.drawImage(mask,0,0);o.globalCompositeOperation='source-over';
+  const pix=o.getImageData(0,0,outc.width,outc.height).data;let r=0,g=0,b=0,n=0;for(let i=0;i<pix.length;i+=16)if(pix[i+3]>55){r+=pix[i];g+=pix[i+1];b+=pix[i+2];n++;}
+  let url,maskAccepted=coverage>=.12&&coverage<=.96;
+  if(maskAccepted)url=await canvasBlobURL(outc);
+  else url=await canvasBlobURL(c,'image/webp',.92); // Better to show the whole detected garment than a tiny wrong saliency island.
+  md.width=md.height=mask.width=mask.height=outc.width=outc.height=1;
+  return {url,coverage,maskAccepted,avgColor:n?[Math.round(r/n),Math.round(g/n),Math.round(b/n)]:[128,128,128]};
+}
+async function analyzeSingle(file,sourceIndex,onProgress,accessory=false){
+  const bm=await loadBitmap(file),allowed=accessory?ACCESSORY_CLASSES:MAIN_SINGLE_CLASSES,{dets,ms,size}=await detectFashion(bm,onProgress,allowed),best=choosePrimary(dets,bm);
+  let box=best?.sourceBox||[0,0,bm.width,bm.height],meta=best?FP_META[best.classId]:['單品（請確認）',accessory?'配件':'上衣'],label=best?FP_CLASSES[best.classId]:'unknown',conf=best?Math.round(best.score*100):0;
+  const rawCandidates=(best?.classCandidates||[]).filter(x=>allowed.has(x.classId)).slice(0,3).map(x=>({name:FP_META[x.classId]?.[0]||FP_CLASSES[x.classId],label:FP_CLASSES[x.classId],score:Math.round(x.score*100)}));
+  const margin=rawCandidates.length>1?(rawCandidates[0].score-rawCandidates[1].score):100;
+  const crop=cropCanvas(bm,box,best?.score>.22?.08:.02),cut=await applyU2Net(crop.canvas,onProgress),bbox=normalizedBox(crop.sourceBox,bm.width,bm.height);
+  const uncertain=!best||conf<78||margin<14;
+  const finalName=uncertain?'單品（請確認）':meta[0],finalCat=uncertain?(accessory?'配件':meta[1]):meta[1];
+  const reasons=[];if(uncertain)reasons.push(`分類器不夠確定${rawCandidates.length?`；候選：${rawCandidates.map(x=>`${x.name} ${x.score}%`).join('、')}`:''}`);if(!cut.maskAccepted)reasons.push('去背遮罩信心不足，先保留完整偵測區域，避免只剩圖案或碎片');
+  const item={id:`${sourceIndex}-single-${Math.random().toString(36).slice(2)}`,name:finalName,cat:finalCat,label,sourceIndex,sourceName:file.name,sourceWidth:bm.width,sourceHeight:bm.height,requestedMode:accessory?'accessory':'single',routeMode:accessory?'accessory':'single',classificationConfidence:conf,classificationCandidates:rawCandidates,needsGenericCategoryReview:uncertain,reviewReason:reasons.join('；'),layerWarning:!cut.maskAccepted?'⚠ 去背模型未通過完整度 Gate，本卡先顯示主要偵測區域。':'',photo:cut.url,photoType:cut.maskAccepted?'detector+foreground-mask':'detector-crop-fallback',bbox,areaRatio:bbox[2]*bbox[3],aspect:bbox[2]/Math.max(.001,bbox[3]),avgColor:cut.avgColor,localDebug:{engine:'FashionPedia detector + U2Netp',detectorMs:ms,inputSize:size,detections:dets.length,maskCoverage:cut.coverage,maskAccepted:cut.maskAccepted}};
+  crop.canvas.width=crop.canvas.height=1;bm.close?.();onProgress?.({type:'inference',sourceIndex,stage:'done',count:1,mode:item.routeMode,ms,backend:runtimeInfo.backend});return [item];
+}
 
 async function analyzeOne(file,sourceIndex,mode,onProgress){
   if(mode==='outfit')return (await analyzeOutfit(file,sourceIndex,onProgress)).items;
@@ -166,11 +212,20 @@ async function analyzeOne(file,sourceIndex,mode,onProgress){
   return resolved==='outfit'?(await analyzeOutfit(file,sourceIndex,onProgress,scene.segments)).items:analyzeSingle(file,sourceIndex,onProgress,false);
 }
 
+async function releaseLocalModels(){
+  const jobs=[];
+  if(detectorSessionPromise)jobs.push((async()=>{try{const s=await detectorSessionPromise;await s?.release?.();}catch{}detectorSessionPromise=null;})());
+  if(cutoutSessionPromise)jobs.push((async()=>{try{const s=await cutoutSessionPromise;await s?.release?.();}catch{}cutoutSessionPromise=null;})());
+  if(outfitPipelinePromise)jobs.push((async()=>{try{const p=await outfitPipelinePromise;await p?.dispose?.();}catch{}outfitPipelinePromise=null;})());
+  await Promise.allSettled(jobs);runtimeInfo.backend='模型已釋放（快取保留）';
+}
+const MOBILE_MEMORY_GUARD=/iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
 window.AIWardrobeSegmentation={
-  version:'5.1-local-router',
-  modelId:'SegFormer outfit + FashionPedia detector + U2Netp cutout',
+  version:'5.2-local-router',
+  modelId:'V5.2 SegFormer mask-fix + FashionPedia + U2Netp soft-alpha',
   getRuntimeInfo(){return {...runtimeInfo};},
   async health(){return {ok:true,local:true,...runtimeInfo};},
-  async segmentFiles(files,onProgress,options={}){const all=[],mode=options.mode||'auto';for(let i=0;i<files.length;i++){onProgress?.({type:'file',index:i,total:files.length,name:files[i].name});onProgress?.({type:'inference',sourceIndex:i,stage:'start'});const items=await analyzeOne(files[i],i,mode,onProgress);all.push(...items);await yieldUI();}return {items:all,duplicates:findDuplicates(all),runtime:{...runtimeInfo}};}
+  async segmentFiles(files,onProgress,options={}){const all=[],mode=options.mode||'auto';try{for(let i=0;i<files.length;i++){onProgress?.({type:'file',index:i,total:files.length,name:files[i].name});onProgress?.({type:'inference',sourceIndex:i,stage:'start'});const items=await analyzeOne(files[i],i,mode,onProgress);all.push(...items);await yieldUI();}return {items:all,duplicates:findDuplicates(all),runtime:{...runtimeInfo}};}finally{if(MOBILE_MEMORY_GUARD||options.releaseAfterBatch){await releaseLocalModels();onProgress?.({type:'memory',status:'released'});}}}
 };
 window.dispatchEvent(new CustomEvent('aiwardrobe-segmenter-ready'));
