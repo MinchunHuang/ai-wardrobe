@@ -11,6 +11,9 @@ const IS_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const MOBILE_MEMORY_GUARD = IS_IOS || /Android/i.test(navigator.userAgent);
 const WORKING_MAX_SIDE = IS_IOS ? 1600 : 1920;
+// Outfit parsing uses a smaller working image on iOS. SegFormer resizes internally anyway,
+// so keeping a 1600px bitmap resident during first model load only increases peak memory.
+const OUTFIT_WORKING_MAX_SIDE = IS_IOS ? 1200 : 1600;
 const OUTPUT_MAX_SIDE = IS_IOS ? 900 : 1200;
 
 // V5.1: route by scene. Outfit uses human-clothes parsing; single/flat uses fashion detection + foreground matting.
@@ -51,11 +54,11 @@ let outfitPipelinePromise = null;
 let detectorSessionPromise = null;
 let cutoutSessionPromise = null;
 let runtimeInfo = {
-  version:'5.3.1-memory-safe',
+  version:'5.3.2-cold-start-safe',
   outfitModel:OUTFIT_MODEL,
   singleDetector:DETECTOR_ID,
   singleCutout:CUTOUT_ID,
-  backend:IS_IOS?'iPhone 安全模式 · 尚未載入':'尚未載入',
+  backend:IS_IOS?'WASM · iPhone 冷啟動安全模式':'尚未載入',
   downloadedBytes:0
 };
 
@@ -180,7 +183,11 @@ function maskAreaRatio(seg){
   const m=seg.mask;if(!m?.data||!m.width||!m.height)return 0;const pixels=m.width*m.height;let n=0;for(let p=0;p<pixels;p++)if(maskPixelValue(m,p)>8)n++;return n/Math.max(1,pixels);
 }
 async function analyzeOutfit(file,sourceIndex,onProgress,preSegments=null){
-  const bm=await loadBitmap(file,WORKING_MAX_SIDE),url=await bitmapToBlobURL(bm,Math.min(WORKING_MAX_SIDE,1400)),pipe=await getOutfitPipeline(onProgress),segments=preSegments||await pipe(url),items=[];URL.revokeObjectURL(url);
+  // Important on iOS: finish loading/constructing the parser BEFORE decoding the photo.
+  // On the first ever run the model download + session construction is the largest memory spike.
+  const pipe=await getOutfitPipeline(onProgress);
+  if(IS_IOS) await memoryYield(300);
+  const bm=await loadBitmap(file,OUTFIT_WORKING_MAX_SIDE),url=await bitmapToBlobURL(bm,Math.min(OUTFIT_WORKING_MAX_SIDE,1200)),segments=preSegments||await pipe(url),items=[];URL.revokeObjectURL(url);
   const byLabel=new Map();for(const s of segments){if(!byLabel.has(s.label))byLabel.set(s.label,[]);byLabel.get(s.label).push(s);}
   const plans=[];for(const [label,meta] of Object.entries(OUTFIT_MAP))if(byLabel.has(label))plans.push({labels:[label],label,meta,confidence:92});
   const shoeLabels=['Left-shoe','Right-shoe'];if(shoeLabels.some(x=>byLabel.has(x)))plans.push({labels:shoeLabels,label:'Shoes',meta:{name:'鞋子',cat:'鞋包'},confidence:90});
@@ -188,7 +195,10 @@ async function analyzeOutfit(file,sourceIndex,onProgress,preSegments=null){
   bm.close?.();onProgress?.({type:'inference',sourceIndex,stage:'done',count:items.length,mode:'outfit',backend:'local'});return {items,segments};
 }
 async function sceneHasHuman(file,onProgress){
-  const bm=await loadBitmap(file,900),url=await bitmapToBlobURL(bm,900),pipe=await getOutfitPipeline(onProgress),segments=await pipe(url);URL.revokeObjectURL(url);bm.close?.();
+  // Same cold-start ordering as outfit mode: model first, image second.
+  const pipe=await getOutfitPipeline(onProgress);
+  if(IS_IOS) await memoryYield(250);
+  const bm=await loadBitmap(file,720),url=await bitmapToBlobURL(bm,720),segments=await pipe(url);URL.revokeObjectURL(url);bm.close?.();
   let humanHits=0;for(const s of segments)if(HUMAN_LABELS.has(s.label))humanHits+=maskAreaRatio(s)||.01;
   return {hasHuman:humanHits>.012,segments,humanHits};
 }
@@ -263,10 +273,19 @@ async function releaseLocalModels(){
 }
 
 window.AIWardrobeSegmentation={
-  version:'5.3.1-memory-safe',
-  modelId:'V5.3.1 Memory-Safe · SegFormer + FashionPedia + U2Netp',
+  version:'5.3.2-cold-start-safe',
+  modelId:'V5.3.2 Cold-Start Safe · SegFormer + FashionPedia + U2Netp',
   getRuntimeInfo(){return {...runtimeInfo};},
   async health(){return {ok:true,local:true,...runtimeInfo};},
-  async segmentFiles(files,onProgress,options={}){const all=[],mode=options.mode||'auto';try{for(let i=0;i<files.length;i++){onProgress?.({type:'file',index:i,total:files.length,name:files[i].name});onProgress?.({type:'inference',sourceIndex:i,stage:'start'});const items=await analyzeOne(files[i],i,mode,onProgress);all.push(...items);if(IS_IOS){await releaseLocalModels();onProgress?.({type:'memory',status:'released-one',index:i});}await memoryYield(IS_IOS?120:16);}return {items:all,duplicates:findDuplicates(all),runtime:{...runtimeInfo}};}finally{if(MOBILE_MEMORY_GUARD||options.releaseAfterBatch){await releaseLocalModels();onProgress?.({type:'memory',status:'released'});}}}
+  async segmentFiles(files,onProgress,options={}){const all=[],mode=options.mode||'auto';try{
+    // Cold-start gate: for any path that needs SegFormer, prepare it before decoding a user photo.
+    // This separates model download/session construction from image decode and avoids the first-run iOS peak.
+    if(IS_IOS&&(mode==='outfit'||mode==='auto')){
+      onProgress?.({type:'phase',phase:'prepare-outfit-model',message:'首次準備人物穿搭模型；先不解碼原始照片'});
+      await getOutfitPipeline(onProgress);
+      await memoryYield(450);
+      onProgress?.({type:'phase',phase:'outfit-model-ready',message:'人物穿搭模型已就緒，開始處理照片'});
+    }
+    for(let i=0;i<files.length;i++){onProgress?.({type:'file',index:i,total:files.length,name:files[i].name});onProgress?.({type:'inference',sourceIndex:i,stage:'start'});const items=await analyzeOne(files[i],i,mode,onProgress);all.push(...items);if(IS_IOS){await releaseLocalModels();onProgress?.({type:'memory',status:'released-one',index:i});}await memoryYield(IS_IOS?120:16);}return {items:all,duplicates:findDuplicates(all),runtime:{...runtimeInfo}};}finally{if(MOBILE_MEMORY_GUARD||options.releaseAfterBatch){await releaseLocalModels();onProgress?.({type:'memory',status:'released'});}}}
 };
 window.dispatchEvent(new CustomEvent('aiwardrobe-segmenter-ready'));
