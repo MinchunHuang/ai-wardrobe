@@ -22,6 +22,26 @@ const DETECTOR_ID = 'louisJLN/yolo8-fashionpedia::yolov8n';
 const DETECTOR_URL = 'https://huggingface.co/louisJLN/yolo8-fashionpedia/resolve/main/results/yolov8n-fashionpedia-1.onnx';
 const CUTOUT_ID = 'edgetools/u2netp';
 const CUTOUT_URL = 'https://huggingface.co/edgetools/u2netp/resolve/main/u2netp.onnx';
+// V5.4: use the detector only to localize the main garment. A lightweight zero-shot
+// image classifier re-ranks the garment type after cutout so a pair of pants is not
+// forced to inherit a detector's mistaken `jacket` class. MobileCLIP S0 has a small
+// quantized vision tower and is supported directly by Transformers.js.
+const GARMENT_CLASSIFIER_MODEL = 'Xenova/mobileclip_s0';
+const GARMENT_CLASSES = [
+  {key:'shirt', prompt:'a button-up shirt or blouse with a collar and front buttons', name:'襯衫／上衣', cat:'上衣', fpIds:[0]},
+  {key:'tshirt', prompt:'a T-shirt or sweatshirt with no full front opening', name:'T-shirt／上衣', cat:'上衣', fpIds:[1]},
+  {key:'sweater', prompt:'a sweater or knit pullover', name:'針織／毛衣', cat:'上衣', fpIds:[2]},
+  {key:'cardigan', prompt:'an open-front cardigan', name:'開襟衫', cat:'外套', fpIds:[3]},
+  {key:'jacket', prompt:'a jacket or light outerwear with sleeves', name:'外套', cat:'外套', fpIds:[4]},
+  {key:'vest', prompt:'a sleeveless vest', name:'背心', cat:'上衣', fpIds:[5]},
+  {key:'pants', prompt:'a pair of long pants or trousers with two trouser legs', name:'長褲', cat:'下身', fpIds:[6]},
+  {key:'shorts', prompt:'a pair of shorts with two short trouser legs', name:'短褲', cat:'下身', fpIds:[7]},
+  {key:'skirt', prompt:'a skirt with one continuous lower opening and no separate trouser legs', name:'裙子', cat:'下身', fpIds:[8]},
+  {key:'coat', prompt:'a long coat or overcoat', name:'大衣', cat:'外套', fpIds:[9]},
+  {key:'dress', prompt:'a one-piece dress', name:'洋裝', cat:'洋裝', fpIds:[10]},
+  {key:'jumpsuit', prompt:'a one-piece jumpsuit with a top and trouser legs', name:'連身褲', cat:'洋裝', fpIds:[11]},
+  {key:'cape', prompt:'a cape or shawl outer garment', name:'披肩', cat:'外套', fpIds:[12]}
+];
 
 const FP_CLASSES = [
   'shirt, blouse','top, t-shirt, sweatshirt','sweater','cardigan','jacket','vest','pants','shorts','skirt','coat','dress','jumpsuit','cape',
@@ -53,11 +73,13 @@ const HUMAN_LABELS = new Set(['Face','Hair','Left-arm','Right-arm','Left-leg','R
 let outfitPipelinePromise = null;
 let detectorSessionPromise = null;
 let cutoutSessionPromise = null;
+let garmentClassifierPromise = null;
 let runtimeInfo = {
-  version:'5.3.2-cold-start-safe',
+  version:'5.4-accuracy-pass',
   outfitModel:OUTFIT_MODEL,
   singleDetector:DETECTOR_ID,
   singleCutout:CUTOUT_ID,
+  garmentClassifier:GARMENT_CLASSIFIER_MODEL,
   backend:IS_IOS?'WASM · iPhone 冷啟動安全模式':'尚未載入',
   downloadedBytes:0
 };
@@ -114,6 +136,53 @@ async function getOutfitPipeline(onProgress){
   return outfitPipelinePromise;
 }
 
+async function getGarmentClassifier(onProgress){
+  if(!garmentClassifierPromise){
+    onProgress?.({type:'modelPart',label:'Garment re-ranker',status:'loading'});
+    const opts={dtype:'q8'};
+    if(IS_IOS)opts.device='wasm';
+    else if(navigator.gpu)opts.device='webgpu';
+    opts.progress_callback=(info)=>onProgress?.({type:'model',info});
+    garmentClassifierPromise=pipeline('zero-shot-image-classification',GARMENT_CLASSIFIER_MODEL,opts)
+      .then(p=>{onProgress?.({type:'modelPart',label:'Garment re-ranker',status:'ready'});return p;})
+      .catch(e=>{garmentClassifierPromise=null;throw e});
+  }
+  return garmentClassifierPromise;
+}
+
+function garmentFamily(key){
+  if(['shirt','tshirt','sweater','vest'].includes(key))return 'upper';
+  if(['cardigan','jacket','coat','cape'].includes(key))return 'outer';
+  if(['pants','shorts','skirt'].includes(key))return 'lower';
+  if(['dress','jumpsuit'].includes(key))return 'onepiece';
+  return key;
+}
+function detectorKeyForClassId(id){
+  for(const c of GARMENT_CLASSES)if(c.fpIds.includes(id))return c.key;
+  return 'unknown';
+}
+async function classifyGarmentLocal(imageInput,best,onProgress){
+  const clf=await getGarmentClassifier(onProgress),labels=GARMENT_CLASSES.map(x=>x.prompt);
+  const start=performance.now();
+  const out=await clf(imageInput,labels,{hypothesis_template:'This is a product photo of {}.'});
+  const scoreByPrompt=new Map((Array.isArray(out)?out:[]).map(x=>[x.label,Number(x.score)||0]));
+  const detScores=new Map((best?.classCandidates||[]).map(x=>[x.classId,Number(x.score)||0]));
+  const rows=GARMENT_CLASSES.map(c=>{
+    const clip=scoreByPrompt.get(c.prompt)||0;
+    let det=0;for(const id of c.fpIds)det=Math.max(det,detScores.get(id)||0);
+    // MobileCLIP is the semantic re-ranker; detector class scores are only a weak prior.
+    const fused=clip*.78+det*.22;
+    return {...c,clip,det,fused};
+  }).sort((a,b)=>b.fused-a.fused);
+  const top=rows[0],second=rows[1]||{fused:0},detKey=best?detectorKeyForClassId(best.classId):'unknown';
+  const margin=top.fused-second.fused,agreeFamily=detKey!=='unknown'&&garmentFamily(detKey)===garmentFamily(top.key);
+  const uncertain=!top || (top.clip<.16&&top.fused<.28) || (margin<.035&&!agreeFamily);
+  return {
+    top, second, rows:rows.slice(0,3), uncertain, margin, agreeFamily, detKey,
+    ms:Math.round(performance.now()-start)
+  };
+}
+
 async function probeImageDimensions(file){
   try{
     const ab=await file.slice(0,Math.min(file.size,524288)).arrayBuffer(),v=new DataView(ab);
@@ -164,12 +233,45 @@ async function segmentationResultToMaskCanvas(seg){
   }
   throw new Error('Outfit parser mask 格式不支援');
 }
-async function makeSemanticCutout(bm,segments,labels){
+function cleanSemanticAlpha(alpha,labelKey){
+  const ctx=alpha.getContext('2d',{willReadFrequently:true}),im=ctx.getImageData(0,0,alpha.width,alpha.height),d=im.data,w=alpha.width,h=alpha.height,n=w*h,seen=new Uint8Array(n),parts=[];
+  const idx=(x,y)=>y*w+x;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const start=idx(x,y);if(seen[start]||d[start*4+3]<=40)continue;const q=[start],pix=[];seen[start]=1;for(let qi=0;qi<q.length;qi++){const p=q[qi],px=p%w,py=(p/w)|0;pix.push(p);const ns=[[px-1,py],[px+1,py],[px,py-1],[px,py+1]];for(const [nx,ny] of ns){if(nx<0||ny<0||nx>=w||ny>=h)continue;const ni=idx(nx,ny);if(!seen[ni]&&d[ni*4+3]>40){seen[ni]=1;q.push(ni)}}}parts.push(pix)}
+  if(!parts.length)return;parts.sort((a,b)=>b.length-a.length);const largest=parts[0].length,maxKeep=labelKey==='Shoes'?2:(['Hat','Sunglasses','Belt','Scarf'].includes(labelKey)?1:3),keep=new Uint8Array(n);let used=0;for(const part of parts){if(used>=maxKeep)break;if(part.length<Math.max(8,largest*.08))continue;for(const p of part)keep[p]=1;used++;}
+  for(let p=0;p<n;p++)if(!keep[p])d[p*4+3]=0;ctx.putImageData(im,0,0);
+}
+function semanticSegmentBBox(seg){
+  const m=seg?.mask;if(!m?.data||!m.width||!m.height)return null;let minX=m.width,minY=m.height,maxX=-1,maxY=-1;
+  for(let y=0;y<m.height;y+=2)for(let x=0;x<m.width;x+=2){const p=y*m.width+x;if(maskPixelValue(m,p)>8){minX=Math.min(minX,x);minY=Math.min(minY,y);maxX=Math.max(maxX,x);maxY=Math.max(maxY,y);}}
+  if(maxX<minX||maxY<minY)return null;return [minX/m.width,minY/m.height,(maxX-minX+1)/m.width,(maxY-minY+1)/m.height];
+}
+function nearHead(bbox,segments,maxDist=.22){
+  const [x,y,w,h]=bbox,cx=x+w/2,cy=y+h/2,heads=segments.filter(s=>s.label==='Hair'||s.label==='Face').map(semanticSegmentBBox).filter(Boolean);
+  if(!heads.length)return cy<.26;
+  return heads.some(b=>{const hx=b[0]+b[2]/2,hy=b[1]+b[3]/2;return Math.hypot(cx-hx,cy-hy)<maxDist;});
+}
+function plausibleOutfitCandidate(label,bbox,area,segments){
+  const [x,y,w,h]=bbox,cy=y+h/2,bottom=y+h;
+  if(label==='Upper-clothes')return area>=.012&&cy<.72;
+  if(label==='Pants')return area>=.012&&cy>.28;
+  if(label==='Skirt')return area>=.008&&cy>.30;
+  if(label==='Dress')return area>=.018;
+  if(label==='Shoes')return area>=.001&&bottom>.58;
+  if(label==='Bag')return area>=.003;
+  if(label==='Belt')return area>=.0008&&cy>.28&&cy<.75&&w>h*.9;
+  if(label==='Scarf')return area>=.001&&cy<.56;
+  if(label==='Sunglasses')return area>=.00025&&cy<.36&&nearHead(bbox,segments,.18);
+  if(label==='Hat')return area>=.0007&&area<=.10&&cy<.34&&nearHead(bbox,segments,.23);
+  return true;
+}
+
+async function makeSemanticCutout(bm,segments,labels,labelKey){
   const masks=[];for(const s of segments){if(labels.includes(s.label))masks.push(await segmentationResultToMaskCanvas(s));}
   if(!masks.length)return null;
   // Keep the working alpha canvas at model/preview resolution instead of full 24MP source resolution.
   const mw=masks[0].width,mh=masks[0].height,alpha=document.createElement('canvas');alpha.width=mw;alpha.height=mh;const actx=alpha.getContext('2d');
   for(const m of masks){actx.globalCompositeOperation='source-over';actx.drawImage(m,0,0,mw,mh);}
+  cleanSemanticAlpha(alpha,labelKey||labels[0]||'');
   const ad=actx.getImageData(0,0,mw,mh).data;let minX=mw,minY=mh,maxX=-1,maxY=-1;
   for(let y=0;y<mh;y+=2)for(let x=0;x<mw;x+=2){if(ad[(y*mw+x)*4+3]>40){minX=Math.min(minX,x);minY=Math.min(minY,y);maxX=Math.max(maxX,x);maxY=Math.max(maxY,y);}}
   if(maxX<minX||maxY<minY){alpha.width=alpha.height=1;return null;}
@@ -191,7 +293,7 @@ async function analyzeOutfit(file,sourceIndex,onProgress,preSegments=null){
   const byLabel=new Map();for(const s of segments){if(!byLabel.has(s.label))byLabel.set(s.label,[]);byLabel.get(s.label).push(s);}
   const plans=[];for(const [label,meta] of Object.entries(OUTFIT_MAP))if(byLabel.has(label))plans.push({labels:[label],label,meta,confidence:92});
   const shoeLabels=['Left-shoe','Right-shoe'];if(shoeLabels.some(x=>byLabel.has(x)))plans.push({labels:shoeLabels,label:'Shoes',meta:{name:'鞋子',cat:'鞋包'},confidence:90});
-  let idx=0;for(const p of plans){const segs=segments.filter(s=>p.labels.includes(s.label)),cut=await makeSemanticCutout(bm,segs,p.labels);if(!cut)continue;const bbox=normalizedBox(cut.box,bm.width,bm.height),area=bbox[2]*bbox[3];if(area<.002)continue;items.push({id:`${sourceIndex}-outfit-${idx++}-${Math.random().toString(36).slice(2)}`,name:p.meta.name,cat:p.meta.cat,label:p.label,sourceIndex,sourceName:file.name,sourceWidth:bm.width,sourceHeight:bm.height,requestedMode:'outfit',routeMode:'outfit',classificationConfidence:p.confidence,needsGenericCategoryReview:false,reviewReason:'',layerWarning:p.label==='Upper-clothes'?'人物多層穿搭仍可能把外套與內搭合成同一個上身區域。':'',photo:cut.url,photoType:'semantic-mask',bbox,areaRatio:area,aspect:bbox[2]/Math.max(.001,bbox[3]),avgColor:cut.avgColor,localDebug:{engine:'SegFormer clothes parser'}});}
+  let idx=0;for(const p of plans){const segs=segments.filter(s=>p.labels.includes(s.label)),cut=await makeSemanticCutout(bm,segs,p.labels,p.label);if(!cut)continue;const bbox=normalizedBox(cut.box,bm.width,bm.height),area=bbox[2]*bbox[3];if(!plausibleOutfitCandidate(p.label,bbox,area,segments)){URL.revokeObjectURL(cut.url);continue;}items.push({id:`${sourceIndex}-outfit-${idx++}-${Math.random().toString(36).slice(2)}`,name:p.meta.name,cat:p.meta.cat,label:p.label,sourceIndex,sourceName:file.name,sourceWidth:bm.width,sourceHeight:bm.height,requestedMode:'outfit',routeMode:'outfit',classificationConfidence:p.confidence,needsGenericCategoryReview:false,reviewReason:'',layerWarning:p.label==='Upper-clothes'?'人物多層穿搭仍可能把外套與內搭合成同一個上身區域。':'',photo:cut.url,photoType:'semantic-mask',bbox,areaRatio:area,aspect:bbox[2]/Math.max(.001,bbox[3]),avgColor:cut.avgColor,localDebug:{engine:'SegFormer clothes parser + spatial plausibility'}});}
   bm.close?.();onProgress?.({type:'inference',sourceIndex,stage:'done',count:items.length,mode:'outfit',backend:'local'});return {items,segments};
 }
 async function sceneHasHuman(file,onProgress){
@@ -212,7 +314,7 @@ function decodeYoloDetection(tensor,conf=.18){
   else if(d[2]===4+nc){count=d[1];channels=d[2];at=(n,c)=>tensor.data[n*channels+c];}
   else if(d[2]===6){return Array.from({length:d[1]},(_,n)=>({box:[tensor.data[n*6],tensor.data[n*6+1],tensor.data[n*6+2],tensor.data[n*6+3]],score:tensor.data[n*6+4],classId:Math.round(tensor.data[n*6+5])})).filter(x=>x.score>=conf);}
   else throw new Error(`Fashion detector channels 不符：${d.join('×')}`);
-  const out=[];for(let n=0;n<count;n++){const cx=at(n,0),cy=at(n,1),w=at(n,2),h=at(n,3),scores=[];for(let c=0;c<nc;c++)scores.push({classId:c,score:Number(at(n,4+c))});scores.sort((a,b)=>b.score-a.score);const top=scores[0];if(!top||top.score<conf)continue;out.push({box:[cx-w/2,cy-h/2,cx+w/2,cy+h/2],score:top.score,classId:top.classId,classCandidates:scores.slice(0,3)});}return out;
+  const out=[];for(let n=0;n<count;n++){const cx=at(n,0),cy=at(n,1),w=at(n,2),h=at(n,3),scores=[];for(let c=0;c<nc;c++)scores.push({classId:c,score:Number(at(n,4+c))});scores.sort((a,b)=>b.score-a.score);const top=scores[0];if(!top||top.score<conf)continue;out.push({box:[cx-w/2,cy-h/2,cx+w/2,cy+h/2],score:top.score,classId:top.classId,classCandidates:scores.slice(0,5)});}return out;
 }
 function inverseDetBox(box,prep){const [x1,y1,x2,y2]=box;const sx1=clamp((x1-prep.padX)/prep.scale,0,prep.sourceWidth),sy1=clamp((y1-prep.padY)/prep.scale,0,prep.sourceHeight),sx2=clamp((x2-prep.padX)/prep.scale,0,prep.sourceWidth),sy2=clamp((y2-prep.padY)/prep.scale,0,prep.sourceHeight);return [sx1,sy1,Math.max(1,sx2-sx1),Math.max(1,sy2-sy1)];}
 async function detectFashion(bm,onProgress,allowedSet){const ort=getOrt(),s=await getDetector(onProgress),name=s.inputNames?.[0]||'images',meta=s.inputMetadata?.[0]||{},dims=meta.shape||meta.dimensions||[],h=Number(dims[dims.length-2]),size=Number.isFinite(h)&&h>0?h:640,prep=prepareYoloInput(bm,size,ort),start=performance.now(),out=await s.run({[name]:prep.tensor}),pred=Object.values(out).find(t=>t?.dims?.length===3);if(!pred)throw new Error('Fashion detector 沒有 detection tensor');let dets=decodeYoloDetection(pred,.15).filter(x=>allowedSet.has(x.classId));for(const d of dets){if(Math.max(...d.box.map(Math.abs))<=2.2)d.box=d.box.map(v=>v*size);}dets=nms(dets,.45,8);for(const d of dets)d.sourceBox=inverseDetBox(d.box,prep);return {dets,ms:Math.round(performance.now()-start),size};}
@@ -237,19 +339,42 @@ async function applyU2Net(c,onProgress){
 }
 async function analyzeSingle(file,sourceIndex,onProgress,accessory=false){
   const bm=await loadBitmap(file,WORKING_MAX_SIDE),allowed=accessory?ACCESSORY_CLASSES:MAIN_SINGLE_CLASSES,{dets,ms,size}=await detectFashion(bm,onProgress,allowed),best=choosePrimary(dets,bm);
-  // Do not keep detector and cutout models resident at the same time on iOS.
   if(IS_IOS){await releaseDetectorOnly();await memoryYield();}
-  let box=best?.sourceBox||[0,0,bm.width,bm.height],meta=best?FP_META[best.classId]:['單品（請確認）',accessory?'配件':'上衣'],label=best?FP_CLASSES[best.classId]:'unknown',conf=best?Math.round(best.score*100):0;
-  const rawCandidates=(best?.classCandidates||[]).filter(x=>allowed.has(x.classId)).slice(0,3).map(x=>({name:FP_META[x.classId]?.[0]||FP_CLASSES[x.classId],label:FP_CLASSES[x.classId],score:Math.round(x.score*100)}));
-  const margin=rawCandidates.length>1?(rawCandidates[0].score-rawCandidates[1].score):100;
-  const crop=cropCanvas(bm,box,best?.score>.22?.08:.02),cut=await applyU2Net(crop.canvas,onProgress),bbox=normalizedBox(crop.sourceBox,bm.width,bm.height);
+  const sourceW=bm.width,sourceH=bm.height,box=best?.sourceBox||[0,0,sourceW,sourceH],crop=cropCanvas(bm,box,best?.score>.22?.08:.02),bbox=normalizedBox(crop.sourceBox,sourceW,sourceH);
+  const cut=await applyU2Net(crop.canvas,onProgress);
   if(IS_IOS){await releaseCutoutOnly();await memoryYield();}
-  const uncertain=!best||conf<78||margin<14;
-  const finalName=uncertain?'單品（請確認）':meta[0],finalCat=uncertain?(accessory?'配件':meta[1]):meta[1];
-  const reasons=[];if(uncertain)reasons.push(`分類器不夠確定${rawCandidates.length?`；候選：${rawCandidates.map(x=>`${x.name} ${x.score}%`).join('、')}`:''}`);if(!cut.maskAccepted)reasons.push('去背遮罩信心不足，先保留完整偵測區域，避免只剩圖案或碎片');
-  const item={id:`${sourceIndex}-single-${Math.random().toString(36).slice(2)}`,name:finalName,cat:finalCat,label,sourceIndex,sourceName:file.name,sourceWidth:bm.width,sourceHeight:bm.height,requestedMode:accessory?'accessory':'single',routeMode:accessory?'accessory':'single',classificationConfidence:conf,classificationCandidates:rawCandidates,needsGenericCategoryReview:uncertain,reviewReason:reasons.join('；'),layerWarning:!cut.maskAccepted?'⚠ 去背模型未通過完整度 Gate，本卡先顯示主要偵測區域。':'',photo:cut.url,photoType:cut.maskAccepted?'detector+foreground-mask':'detector-crop-fallback',bbox,areaRatio:bbox[2]*bbox[3],aspect:bbox[2]/Math.max(.001,bbox[3]),avgColor:cut.avgColor,localDebug:{engine:'FashionPedia detector + U2Netp',detectorMs:ms,inputSize:size,detections:dets.length,maskCoverage:cut.coverage,maskAccepted:cut.maskAccepted}};
-  crop.canvas.width=crop.canvas.height=1;bm.close?.();onProgress?.({type:'inference',sourceIndex,stage:'done',count:1,mode:item.routeMode,ms,backend:runtimeInfo.backend});return [item];
+  crop.canvas.width=crop.canvas.height=1;bm.close?.();
+
+  let finalName='單品（請確認）',finalCat=accessory?'配件':'上衣',label=best?FP_CLASSES[best.classId]:'unknown',conf=best?Math.round(best.score*100):0,uncertain=!best,rawCandidates=[],clipInfo=null;
+  if(accessory){
+    const meta=best?FP_META[best.classId]:['配件（請確認）','配件'];
+    finalName=best&&conf>=75?meta[0]:'配件（請確認）';finalCat=meta[1]||'配件';uncertain=!best||conf<75;
+    rawCandidates=(best?.classCandidates||[]).filter(x=>allowed.has(x.classId)).slice(0,3).map(x=>({name:FP_META[x.classId]?.[0]||FP_CLASSES[x.classId],label:FP_CLASSES[x.classId],score:Math.round(x.score*100)}));
+  }else{
+    try{
+      // All heavy detector/matting sessions are already gone before MobileCLIP loads.
+      clipInfo=await classifyGarmentLocal(cut.url,best,onProgress);
+      const t=clipInfo.top;label=t?.key||label;conf=t?Math.round(t.fused*100):conf;
+      rawCandidates=(clipInfo.rows||[]).map(x=>({name:x.name,label:x.key,score:Math.round(x.fused*100),clip:Math.round(x.clip*100),detector:Math.round(x.det*100)}));
+      uncertain=clipInfo.uncertain;
+      if(t){finalName=uncertain?'單品（請確認）':t.name;finalCat=t.cat;}
+    }catch(e){
+      console.warn('MobileCLIP re-ranker failed, fallback to detector',e);
+      const meta=best?FP_META[best.classId]:['單品（請確認）','上衣'];
+      finalName=best&&conf>=82?meta[0]:'單品（請確認）';finalCat=meta[1]||'上衣';uncertain=!best||conf<82;
+      rawCandidates=(best?.classCandidates||[]).filter(x=>allowed.has(x.classId)).slice(0,3).map(x=>({name:FP_META[x.classId]?.[0]||FP_CLASSES[x.classId],label:FP_CLASSES[x.classId],score:Math.round(x.score*100)}));
+    }finally{
+      if(IS_IOS){await releaseGarmentClassifierOnly();await memoryYield(160);}
+    }
+  }
+  const reasons=[];
+  if(uncertain)reasons.push(`分類仍不夠確定${rawCandidates.length?`；候選：${rawCandidates.map(x=>`${x.name} ${x.score}%`).join('、')}`:''}`);
+  if(clipInfo&&best&&clipInfo.detKey!=='unknown'&&garmentFamily(clipInfo.detKey)!==garmentFamily(clipInfo.top?.key||''))reasons.push('定位模型與語意分類器意見不同，已降低自動採信');
+  if(!cut.maskAccepted)reasons.push('去背遮罩信心不足，先保留完整偵測區域，避免只剩圖案或碎片');
+  const item={id:`${sourceIndex}-single-${Math.random().toString(36).slice(2)}`,name:finalName,cat:finalCat,label,sourceIndex,sourceName:file.name,sourceWidth:sourceW,sourceHeight:sourceH,requestedMode:accessory?'accessory':'single',routeMode:accessory?'accessory':'single',classificationConfidence:conf,classificationCandidates:rawCandidates,needsGenericCategoryReview:uncertain,reviewReason:reasons.join('；'),layerWarning:!cut.maskAccepted?'⚠ 去背模型未通過完整度 Gate，本卡先顯示主要偵測區域。':'',photo:cut.url,photoType:cut.maskAccepted?'detector+foreground-mask':'detector-crop-fallback',bbox,areaRatio:bbox[2]*bbox[3],aspect:bbox[2]/Math.max(.001,bbox[3]),avgColor:cut.avgColor,localDebug:{engine:accessory?'FashionPedia detector + U2Netp':'FashionPedia locator + U2Netp + MobileCLIP S0 re-ranker',detectorMs:ms,classifierMs:clipInfo?.ms||0,inputSize:size,detections:dets.length,maskCoverage:cut.coverage,maskAccepted:cut.maskAccepted}};
+  onProgress?.({type:'inference',sourceIndex,stage:'done',count:1,mode:item.routeMode,ms:ms+(clipInfo?.ms||0),backend:runtimeInfo.backend});return [item];
 }
+
 
 async function analyzeOne(file,sourceIndex,mode,onProgress){
   if(mode==='outfit'){const r=(await analyzeOutfit(file,sourceIndex,onProgress)).items;if(IS_IOS){await releaseOutfitOnly();await memoryYield();}return r;}
@@ -264,17 +389,18 @@ async function analyzeOne(file,sourceIndex,mode,onProgress){
 async function releaseDetectorOnly(){if(detectorSessionPromise){try{const s=await detectorSessionPromise;await s?.release?.();}catch{}detectorSessionPromise=null;}}
 async function releaseCutoutOnly(){if(cutoutSessionPromise){try{const s=await cutoutSessionPromise;await s?.release?.();}catch{}cutoutSessionPromise=null;}}
 async function releaseOutfitOnly(){if(outfitPipelinePromise){try{const p=await outfitPipelinePromise;await p?.dispose?.();}catch{}outfitPipelinePromise=null;}}
+async function releaseGarmentClassifierOnly(){if(garmentClassifierPromise){try{const p=await garmentClassifierPromise;await p?.dispose?.();}catch{}garmentClassifierPromise=null;}}
 async function memoryYield(ms=80){await new Promise(r=>setTimeout(r,ms));}
 
 async function releaseLocalModels(){
-  await Promise.allSettled([releaseDetectorOnly(),releaseCutoutOnly(),releaseOutfitOnly()]);
+  await Promise.allSettled([releaseDetectorOnly(),releaseCutoutOnly(),releaseOutfitOnly(),releaseGarmentClassifierOnly()]);
   runtimeInfo.backend=IS_IOS?'模型已釋放 · iPhone 安全模式':'模型已釋放（快取保留）';
   if(IS_IOS)await memoryYield(120);
 }
 
 window.AIWardrobeSegmentation={
-  version:'5.3.2-cold-start-safe',
-  modelId:'V5.3.2 Cold-Start Safe · SegFormer + FashionPedia + U2Netp',
+  version:'5.4-accuracy-pass',
+  modelId:'V5.4 Accuracy Pass · SegFormer + FashionPedia locator + U2Netp + MobileCLIP S0',
   getRuntimeInfo(){return {...runtimeInfo};},
   async health(){return {ok:true,local:true,...runtimeInfo};},
   async segmentFiles(files,onProgress,options={}){const all=[],mode=options.mode||'auto';try{

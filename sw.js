@@ -1,4 +1,4 @@
-const CACHE='ai-wardrobe-v5-3-2';
+const CACHE='ai-wardrobe-v5-4';
 const ASSETS=['/','/index.html','/manifest.webmanifest','/local-ai.js'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(ASSETS))));
 self.addEventListener('activate',event=>event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE&&k!=='ai-wardrobe-models-v5-3').map(k=>caches.delete(k))))));
