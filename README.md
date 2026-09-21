@@ -1,27 +1,17 @@
-# AI Wardrobe V5.4 — Local Accuracy Pass
+# AI Wardrobe V5.4.1 — Cache-Safe Hotfix
 
-V5.4 keeps the iPhone memory-safe runtime proven stable in V5.3.2, and now targets recognition accuracy.
+這版針對 iPhone「人物穿搭第一次辨識會重新整理、第二次正常」做根因修正。
 
-## Person-worn outfits
-- Main parser: `Xenova/segformer_b2_clothes` (q8).
-- Adds connected-component cleanup on semantic masks.
-- Adds spatial plausibility gates for hat / sunglasses / belt / scarf / shoes.
-- Example: dark floor objects or flip-flops labelled as `Hat` are rejected unless the mask is actually near the head region.
-- Multi-layer outerwear + innerwear can still merge because this is a semantic human-clothes parser.
+## 根因
+舊版 Service Worker 每次部署升版時會刪除除了 app shell 以外的 Cache Storage；這會連 Transformers.js 預設的 `transformers-cache` 一起刪除。於是每次新部署後，人物 SegFormer 都被迫重新下載並同時建立 WASM session，造成 iOS Safari 冷啟動記憶體尖峰。
 
-## Single / flat garments
-- FashionPedia YOLOv8n is now treated primarily as a **garment locator**, not the final category authority.
-- U2Netp creates the foreground cutout.
-- `Xenova/mobileclip_s0` (q8) then performs zero-shot garment-type re-ranking on the isolated garment.
-- Current prompts distinguish: button-up shirt, T-shirt, sweater, cardigan, jacket, vest, pants, shorts, skirt, coat, dress, jumpsuit, cape/shawl.
-- Detector score is retained only as a weak prior. If the detector and semantic re-ranker disagree and the margin is small, the UI asks the user to confirm instead of presenting a wrong label as certain.
+## V5.4.1 修正
+- Service Worker 只刪舊的 `ai-wardrobe-v*` app-shell cache，不再刪 `transformers-cache`。
+- iPhone 第一次使用人物穿搭時，先把 SegFormer q8 模型與設定檔逐一存進 `transformers-cache`，再建立 pipeline，避免下載與 session 建立重疊。
+- 保留 V5.4 的 WASM、安全工作副本、逐張釋放與準確度流程。
+- UI 會顯示「首次下載人物模型 x/3」與「人物模型檔已存入瀏覽器快取」。
 
-## Runtime / privacy
-- All inference remains local in the browser.
-- iPhone/iPad stays on WASM safety mode.
-- 24MP photos are processed through reduced working copies; originals are not modified.
-- Heavy models are released between stages / images on iOS, while downloaded weights stay cached.
-- The first V5.4 single/flat run downloads the MobileCLIP quantized model once; later runs reuse browser cache.
-
-## Benchmark goal
-Use the same regression photos from V5.3.2. A release passes only if it improves category correctness without reintroducing Safari reloads.
+## 驗收
+1. 新部署後第一次就跑 1 張人物穿搭，頁面不得重整。
+2. 第二次再跑人物穿搭，應直接命中快取，不再重新下載模型。
+3. 單件／平拍三張仍可穩定完成。

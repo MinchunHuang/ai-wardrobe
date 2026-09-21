@@ -1,7 +1,8 @@
 import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
 
 const ORT_VERSION = '1.30.0';
-const CACHE_NAME = 'ai-wardrobe-models-v5-3';
+const CACHE_NAME = 'ai-wardrobe-models-v5-4-1';
+const HF_TRANSFORMERS_CACHE = 'transformers-cache';
 
 // Runtime / memory profile must be defined before any model state is initialized.
 // V5.3 accidentally referenced these names before defining them, which caused the
@@ -70,12 +71,56 @@ const OUTFIT_MAP = {
 };
 const HUMAN_LABELS = new Set(['Face','Hair','Left-arm','Right-arm','Left-leg','Right-leg','Torso-skin']);
 
+
+
+const OUTFIT_CACHE_ASSETS = [
+  `https://huggingface.co/${OUTFIT_MODEL}/resolve/main/config.json`,
+  `https://huggingface.co/${OUTFIT_MODEL}/resolve/main/preprocessor_config.json`,
+  `https://huggingface.co/${OUTFIT_MODEL}/resolve/main/onnx/model_quantized.onnx`,
+];
+
+async function outfitCacheState(){
+  if(!('caches' in window)) return {supported:false,cached:false,count:0,total:OUTFIT_CACHE_ASSETS.length};
+  try{
+    const cache=await caches.open(HF_TRANSFORMERS_CACHE);
+    let count=0;
+    for(const url of OUTFIT_CACHE_ASSETS){ if(await cache.match(url)) count++; }
+    return {supported:true,cached:count===OUTFIT_CACHE_ASSETS.length,count,total:OUTFIT_CACHE_ASSETS.length};
+  }catch{return {supported:false,cached:false,count:0,total:OUTFIT_CACHE_ASSETS.length};}
+}
+
+// iOS cold-start protection: Transformers.js normally downloads and instantiates the
+// model in one pipeline() call. On Safari that temporarily holds download buffers,
+// WASM session memory and image work buffers at once. Pre-cache the three required
+// SegFormer assets first, release the network responses, then construct the pipeline.
+async function ensureOutfitAssetsCached(onProgress){
+  if(!IS_IOS || !('caches' in window)) return;
+  const cache=await caches.open(HF_TRANSFORMERS_CACHE);
+  let done=0;
+  for(const url of OUTFIT_CACHE_ASSETS){
+    if(await cache.match(url)){
+      done++;
+      onProgress?.({type:'phase',phase:'outfit-cache',message:`人物模型快取 ${done}/${OUTFIT_CACHE_ASSETS.length} 已存在`});
+      continue;
+    }
+    onProgress?.({type:'phase',phase:'outfit-cache',message:`首次下載人物模型 ${done+1}/${OUTFIT_CACHE_ASSETS.length}（只需一次）`});
+    const req=new Request(url,{mode:'cors',cache:'no-store'});
+    const res=await fetch(req);
+    if(!res.ok) throw new Error(`人物模型預下載失敗 HTTP ${res.status}`);
+    await cache.put(req,res);
+    done++;
+    await memoryYield(180);
+  }
+  try{ await navigator.storage?.persist?.(); }catch{}
+  onProgress?.({type:'phase',phase:'outfit-cache-ready',message:'人物模型檔已存入瀏覽器快取，開始建立 AI session'});
+}
+
 let outfitPipelinePromise = null;
 let detectorSessionPromise = null;
 let cutoutSessionPromise = null;
 let garmentClassifierPromise = null;
 let runtimeInfo = {
-  version:'5.4-accuracy-pass',
+  version:'5.4.1-cache-safe',
   outfitModel:OUTFIT_MODEL,
   singleDetector:DETECTOR_ID,
   singleCutout:CUTOUT_ID,
@@ -400,16 +445,18 @@ async function releaseLocalModels(){
 
 window.AIWardrobeSegmentation={
   version:'5.4-accuracy-pass',
-  modelId:'V5.4 Accuracy Pass · SegFormer + FashionPedia locator + U2Netp + MobileCLIP S0',
+  modelId:'V5.4.1 Cache-Safe · SegFormer + FashionPedia locator + U2Netp + MobileCLIP S0',
   getRuntimeInfo(){return {...runtimeInfo};},
-  async health(){return {ok:true,local:true,...runtimeInfo};},
+  async health(){return {ok:true,local:true,...runtimeInfo,outfitCache:await outfitCacheState()};},
   async segmentFiles(files,onProgress,options={}){const all=[],mode=options.mode||'auto';try{
     // Cold-start gate: for any path that needs SegFormer, prepare it before decoding a user photo.
     // This separates model download/session construction from image decode and avoids the first-run iOS peak.
     if(IS_IOS&&(mode==='outfit'||mode==='auto')){
-      onProgress?.({type:'phase',phase:'prepare-outfit-model',message:'首次準備人物穿搭模型；先不解碼原始照片'});
+      onProgress?.({type:'phase',phase:'prepare-outfit-model',message:'準備人物穿搭模型；先不解碼原始照片'});
+      await ensureOutfitAssetsCached(onProgress);
+      await memoryYield(500);
       await getOutfitPipeline(onProgress);
-      await memoryYield(450);
+      await memoryYield(650);
       onProgress?.({type:'phase',phase:'outfit-model-ready',message:'人物穿搭模型已就緒，開始處理照片'});
     }
     for(let i=0;i<files.length;i++){onProgress?.({type:'file',index:i,total:files.length,name:files[i].name});onProgress?.({type:'inference',sourceIndex:i,stage:'start'});const items=await analyzeOne(files[i],i,mode,onProgress);all.push(...items);if(IS_IOS){await releaseLocalModels();onProgress?.({type:'memory',status:'released-one',index:i});}await memoryYield(IS_IOS?120:16);}return {items:all,duplicates:findDuplicates(all),runtime:{...runtimeInfo}};}finally{if(MOBILE_MEMORY_GUARD||options.releaseAfterBatch){await releaseLocalModels();onProgress?.({type:'memory',status:'released'});}}}
