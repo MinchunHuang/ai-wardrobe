@@ -3,6 +3,16 @@ import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers
 const ORT_VERSION = '1.30.0';
 const CACHE_NAME = 'ai-wardrobe-models-v5-3';
 
+// Runtime / memory profile must be defined before any model state is initialized.
+// V5.3 accidentally referenced these names before defining them, which caused the
+// ES module to abort during evaluation on every device and left the UI stuck at
+// "準備本機 AI…".
+const IS_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const MOBILE_MEMORY_GUARD = IS_IOS || /Android/i.test(navigator.userAgent);
+const WORKING_MAX_SIDE = IS_IOS ? 1600 : 1920;
+const OUTPUT_MAX_SIDE = IS_IOS ? 900 : 1200;
+
 // V5.1: route by scene. Outfit uses human-clothes parsing; single/flat uses fashion detection + foreground matting.
 const OUTFIT_MODEL = 'Xenova/segformer_b2_clothes';
 const DETECTOR_ID = 'louisJLN/yolo8-fashionpedia::yolov8n';
@@ -41,7 +51,7 @@ let outfitPipelinePromise = null;
 let detectorSessionPromise = null;
 let cutoutSessionPromise = null;
 let runtimeInfo = {
-  version:'5.3-memory-safe',
+  version:'5.3.1-memory-safe',
   outfitModel:OUTFIT_MODEL,
   singleDetector:DETECTOR_ID,
   singleCutout:CUTOUT_ID,
@@ -253,8 +263,8 @@ async function releaseLocalModels(){
 }
 
 window.AIWardrobeSegmentation={
-  version:'5.3-memory-safe',
-  modelId:'V5.3 Memory-Safe · SegFormer + FashionPedia + U2Netp',
+  version:'5.3.1-memory-safe',
+  modelId:'V5.3.1 Memory-Safe · SegFormer + FashionPedia + U2Netp',
   getRuntimeInfo(){return {...runtimeInfo};},
   async health(){return {ok:true,local:true,...runtimeInfo};},
   async segmentFiles(files,onProgress,options={}){const all=[],mode=options.mode||'auto';try{for(let i=0;i<files.length;i++){onProgress?.({type:'file',index:i,total:files.length,name:files[i].name});onProgress?.({type:'inference',sourceIndex:i,stage:'start'});const items=await analyzeOne(files[i],i,mode,onProgress);all.push(...items);if(IS_IOS){await releaseLocalModels();onProgress?.({type:'memory',status:'released-one',index:i});}await memoryYield(IS_IOS?120:16);}return {items:all,duplicates:findDuplicates(all),runtime:{...runtimeInfo}};}finally{if(MOBILE_MEMORY_GUARD||options.releaseAfterBatch){await releaseLocalModels();onProgress?.({type:'memory',status:'released'});}}}
